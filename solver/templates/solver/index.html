@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="ro">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RubikVision Pro</title>
+<style>
+  body{font-family:system-ui,sans-serif;background:#10131a;color:#e8eaf0;margin:0;padding:20px;
+       display:flex;flex-direction:column;align-items:center}
+  h1{margin:0 0 4px}
+  .card{background:#1a1f2b;border-radius:14px;padding:16px;margin:12px 0;width:100%;max-width:520px;box-sizing:border-box}
+  .cam{position:relative}
+  video{width:100%;border-radius:10px;display:block}
+  #frame{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);border:3px solid #fff;
+         box-sizing:border-box;pointer-events:none;
+         background-image:linear-gradient(#fff8 1px,transparent 1px),linear-gradient(90deg,#fff8 1px,transparent 1px);
+         background-size:33.33% 33.33%}
+  button{background:#4f7cff;color:#fff;border:0;border-radius:8px;padding:10px 16px;font-size:15px;
+         cursor:pointer;margin:8px 6px 0 0}
+  button:disabled{opacity:.4;cursor:default}
+  button.sec{background:#2d3548}
+  .grid{display:grid;grid-template-columns:repeat(3,56px);gap:4px;margin:10px 0}
+  .cell{width:56px;height:56px;border-radius:6px;border:2px solid #0006;cursor:pointer}
+  .faces{display:flex;gap:8px;flex-wrap:wrap;margin:8px 0}
+  .mini{display:grid;grid-template-columns:repeat(3,14px);gap:1px}
+  .mini div{width:14px;height:14px}
+  .moves{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
+  .mv{padding:6px 10px;border-radius:6px;background:#2d3548;font-weight:600}
+  .mv.on{background:#4f7cff}
+  .err{color:#ff7a7a}
+  small{color:#9aa3b5}
+</style>
+</head>
+<body>
+  <h1>🧩 RubikVision Pro</h1>
+  <small>Scanează cele 6 fețe și primești soluția pas cu pas.</small>
+
+  <div class="card">
+    <h3 id="stepTitle"></h3>
+    <p id="stepTip"></p>
+    <div class="cam">
+      <video id="video" autoplay playsinline muted></video>
+      <div id="frame"></div>
+    </div>
+    <canvas id="canvas" width="300" height="300" hidden></canvas>
+    <button id="btnScan">📸 Scanează fața</button>
+  </div>
+
+  <div class="card" id="reviewCard" hidden>
+    <b>Verifică culorile</b> <small>(click pe un pătrat ca să îl schimbi)</small>
+    <div class="grid" id="grid"></div>
+    <button id="btnOk">✅ Confirmă fața</button>
+    <button class="sec" id="btnRetry">🔁 Reia</button>
+  </div>
+
+  <div class="card">
+    <b>Fețe confirmate</b>
+    <div class="faces" id="done"></div>
+    <label><small><input type="checkbox" id="save" checked>
+      Salvează culorile confirmate ca date de antrenare pentru Random Forest</small></label><br>
+    <button id="btnSolve" disabled>🧠 Rezolvă cubul</button>
+    <button class="sec" onclick="location.reload()">🔄 De la capăt</button>
+    <p id="msg" class="err"></p>
+  </div>
+
+  <div class="card" id="solCard" hidden>
+    <b>Soluție (<span id="count"></span> mutări)</b>
+    <div class="moves" id="moves"></div>
+    <p id="explain"></p>
+    <button class="sec" id="prev">⬅️ Înapoi</button>
+    <button id="next">Înainte ➡️</button>
+    <p><small>Notație: litera = fața rotită; fără semn = 90° în sensul acelor de ceasornic,
+      ' = invers, 2 = 180°.</small></p>
+  </div>
+
+<script>
+const CSRF = "{{ csrf_token }}";
+const HEADERS = {"Content-Type": "application/json", "X-CSRFToken": CSRF};
+
+const FACES = [
+  {k: "U", t: "Sus (U)",      tip: "Centrul ALB spre cameră, partea cu centrul VERDE jos."},
+  {k: "R", t: "Dreapta (R)",  tip: "Centrul ROȘU spre cameră, centrul alb sus."},
+  {k: "F", t: "Față (F)",     tip: "Centrul VERDE spre cameră, centrul alb sus."},
+  {k: "D", t: "Jos (D)",      tip: "Centrul GALBEN spre cameră, partea cu centrul VERDE sus."},
+  {k: "L", t: "Stânga (L)",   tip: "Centrul PORTOCALIU spre cameră, centrul alb sus."},
+  {k: "B", t: "Spate (B)",    tip: "Centrul ALBASTRU spre cameră, centrul alb sus."},
+];
+const HEX = {W: "#ffffff", Y: "#ffd500", R: "#c41e3a", O: "#ff5800", G: "#009b48", B: "#0046ad"};
+const ORDER = ["W", "Y", "R", "O", "G", "B"];
+const NAMES = {U: "fața de sus", D: "fața de jos", L: "fața din stânga",
+               R: "fața din dreapta", F: "fața din față", B: "fața din spate"};
+
+let step = 0, faces = [], current = null, solution = [], pos = 0;
+const $ = id => document.getElementById(id);
+
+/* ---------- Cameră ---------- */
+async function startCam() {
+  try {
+    const s = await navigator.mediaDevices.getUserMedia({video: {facingMode: "environment"}});
+    $("video").srcObject = s;
+  } catch (e) {
+    $("msg").textContent = "Nu pot accesa camera: " + e.message;
+  }
+}
+function sizeFrame() {
+  const v = $("video");
+  const s = 0.6 * Math.min(v.clientWidth, v.clientHeight);
+  $("frame").style.width = s + "px";
+  $("frame").style.height = s + "px";
+}
+["loadedmetadata", "playing", "resize"].forEach(ev => $("video").addEventListener(ev, sizeFrame));
+window.addEventListener("resize", sizeFrame);
+
+/* ---------- Scanare ---------- */
+$("btnScan").onclick = async () => {
+  const v = $("video");
+  const vw = v.videoWidth, vh = v.videoHeight;
+  if (!vw) { $("msg").textContent = "Camera nu e pornită."; return; }
+  const side = 0.6 * Math.min(vw, vh);
+  const ctx = $("canvas").getContext("2d");
+  ctx.drawImage(v, (vw - side) / 2, (vh - side) / 2, side, side, 0, 0, 300, 300);
+  const image = $("canvas").toDataURL("image/jpeg", 0.9);
+
+  $("msg").textContent = "";
+  const r = await fetch("/api/scan-face/", {method: "POST", headers: HEADERS, body: JSON.stringify({image})});
+  const d = await r.json();
+  if (!r.ok) { $("msg").textContent = d.error; return; }
+  current = d;
+  renderGrid();
+  $("reviewCard").hidden = false;
+};
+
+function renderGrid() {
+  const g = $("grid");
+  g.innerHTML = "";
+  current.colors.forEach((c, i) => {
+    const d = document.createElement("div");
+    d.className = "cell";
+    d.style.background = HEX[c];
+    d.onclick = () => {
+      current.colors[i] = ORDER[(ORDER.indexOf(current.colors[i]) + 1) % 6];
+      renderGrid();
+    };
+    g.appendChild(d);
+  });
+}
+
+$("btnOk").onclick = () => {
+  faces.push(current);
+  current = null;
+  $("reviewCard").hidden = true;
+  step++;
+  renderDone();
+  renderStep();
+};
+$("btnRetry").onclick = () => { current = null; $("reviewCard").hidden = true; };
+
+function renderStep() {
+  if (step < 6) {
+    $("stepTitle").textContent = `Fața ${step + 1}/6 — ${FACES[step].t}`;
+    $("stepTip").textContent = FACES[step].tip;
+    $("btnScan").disabled = false;
+  } else {
+    $("stepTitle").textContent = "Toate fețele sunt scanate ✔";
+    $("stepTip").textContent = "Apasă „Rezolvă cubul”.";
+    $("btnScan").disabled = true;
+  }
+  $("btnSolve").disabled = step < 6;
+}
+
+function renderDone() {
+  const box = $("done");
+  box.innerHTML = "";
+  faces.forEach(f => {
+    const m = document.createElement("div");
+    m.className = "mini";
+    f.colors.forEach(c => {
+      const d = document.createElement("div");
+      d.style.background = HEX[c];
+      m.appendChild(d);
+    });
+    box.appendChild(m);
+  });
+}
+
+/* ---------- Rezolvare ---------- */
+$("btnSolve").onclick = async () => {
+  $("msg").textContent = "";
+  const r = await fetch("/api/solve/", {
+    method: "POST", headers: HEADERS,
+    body: JSON.stringify({faces, save_samples: $("save").checked})
+  });
+  const d = await r.json();
+  if (!r.ok) { $("msg").textContent = d.error; return; }
+  solution = d.moves.split(" ").filter(Boolean);
+  pos = 0;
+  renderSol();
+  $("solCard").hidden = false;
+};
+
+function explain(m) {
+  const mod = m.slice(1);
+  const dir = mod === "2" ? "180°"
+            : mod === "'" ? "90° invers acelor de ceasornic"
+            : "90° în sensul acelor de ceasornic";
+  return `Rotește ${NAMES[m[0]]} ${dir}.`;
+}
+
+function renderSol() {
+  $("count").textContent = solution.length;
+  const box = $("moves");
+  box.innerHTML = "";
+  solution.forEach((m, i) => {
+    const s = document.createElement("span");
+    s.className = "mv" + (i === pos ? " on" : "");
+    s.textContent = m;
+    box.appendChild(s);
+  });
+  $("explain").textContent = solution.length
+    ? `Pasul ${pos + 1}/${solution.length}: ` + explain(solution[pos])
+    : "Cubul este deja rezolvat 🎉";
+  $("prev").disabled = pos === 0;
+  $("next").disabled = pos >= solution.length - 1;
+}
+$("prev").onclick = () => { pos--; renderSol(); };
+$("next").onclick = () => { pos++; renderSol(); };
+
+startCam();
+renderStep();
+</script>
+</body>
+</html>

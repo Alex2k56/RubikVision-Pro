@@ -1,0 +1,6 @@
+Django>=5.0
+opencv-python-headless
+scikit-learn
+pandas
+numpy
+RubikTwoPhase
